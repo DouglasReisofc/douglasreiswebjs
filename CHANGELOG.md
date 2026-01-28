@@ -2,6 +2,11 @@
 
 This fork carries targeted fixes on top of upstream `whatsapp-web.js`.
 
+## 1.34.13
+- Force-ready fallback after `authenticated` and at 99% loading to avoid stuck readiness.
+- Add safety wait for Store.Msg and minimal WWebJS utils when injection stalls.
+- Retry ready emission if initial store injection does not complete.
+
 ## 1.34.12
 - Add node-side message dedupe to prevent duplicate `message` events when WA emits multiple internal signals.
 - Keep existing message fallbacks and polling but ensure only one emit per message id within a short TTL.
