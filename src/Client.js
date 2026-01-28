@@ -91,6 +91,7 @@ class Client extends EventEmitter {
         this._appStateHasSyncedInProgress = false;
         this._loadingScreenFinished = false;
         this._lastOfflineProgress = null;
+        this._eventListenersAttached = false;
 
         Util.setFfmpegPath(this.options.ffmpegPath);
     }
@@ -99,6 +100,7 @@ class Client extends EventEmitter {
      * Private function
      */
     async inject() {
+        this._eventListenersAttached = false;
         await this.pupPage.waitForFunction('window.Debug?.VERSION != undefined', {timeout: this.options.authTimeoutMs});
         await this.setDeviceName(this.options.deviceName, this.options.browserName);
         const pairWithPhoneNumber = this.options.pairWithPhoneNumber;
@@ -255,30 +257,39 @@ class Client extends EventEmitter {
                     }
 
                     if (storeReady) {
-                        try {
-                            /**
-                                 * Current connection information
-                                 * @type {ClientInfo}
-                                 */
-                            this.info = new ClientInfo(this, await this.pupPage.evaluate(() => {
-                                return { ...window.Store.Conn.serialize(), wid: window.Store.User.getMaybeMePnUser() || window.Store.User.getMaybeMeLidUser() };
-                            }));
-
-                            this.interface = new InterfaceController(this);
-
-                            //Load util functions (serializers, helper functions)
-                            await this.pupPage.evaluate(LoadUtils);
-
-                            await this.attachEventListeners();
-                        } catch (_) {
-                            // best-effort: still allow ready to emit
-                        }
+                        //Load util functions (serializers, helper functions)
+                        await this.pupPage.evaluate(LoadUtils);
                     }
                 }
 
-                if (!storeReady) {
+                const waitForStoreAndUtils = async (timeoutMs) => {
+                    try {
+                        await this.pupPage.waitForFunction('window.Store != undefined && window.WWebJS != undefined && window.Store.Msg != undefined', { timeout: timeoutMs });
+                        return true;
+                    } catch (_) {
+                        return false;
+                    }
+                };
+
+                if (!storeReady || !(await waitForStoreAndUtils(15000))) {
                     return;
                 }
+
+                if (!this.info) {
+                    /**
+                         * Current connection information
+                         * @type {ClientInfo}
+                         */
+                    this.info = new ClientInfo(this, await this.pupPage.evaluate(() => {
+                        return { ...window.Store.Conn.serialize(), wid: window.Store.User.getMaybeMePnUser() || window.Store.User.getMaybeMeLidUser() };
+                    }));
+                }
+
+                if (!this.interface) {
+                    this.interface = new InterfaceController(this);
+                }
+
+                await this.attachEventListeners();
 
                 if (!this._loadingScreenFinished) {
                     this._lastOfflineProgress = 100;
@@ -359,6 +370,7 @@ class Client extends EventEmitter {
         this._appStateHasSyncedInProgress = false;
         this._loadingScreenFinished = false;
         this._lastOfflineProgress = null;
+        this._eventListenersAttached = false;
 
         let 
             /**
@@ -475,6 +487,7 @@ class Client extends EventEmitter {
      * @property {boolean} reinject is this a reinject?
      */
     async attachEventListeners() {
+        if (this._eventListenersAttached) return;
         await exposeFunctionIfAbsent(this.pupPage, 'onAddMessageEvent', msg => {
             if (msg.type === 'gp2') {
                 const notification = new GroupNotification(this, msg);
@@ -802,6 +815,7 @@ class Client extends EventEmitter {
         });
 
         await this.pupPage.evaluate(() => {
+            if (window.__wwebjsEventListenersAttached) return;
             window.Store.Msg.on('change', (msg) => { window.onChangeMessageEvent(window.WWebJS.getMessageModel(msg)); });
             window.Store.Msg.on('change:type', (msg) => { window.onChangeMessageTypeEvent(window.WWebJS.getMessageModel(msg)); });
             window.Store.Msg.on('change:ack', (msg, ack) => { window.onMessageAckEvent(window.WWebJS.getMessageModel(msg), ack); });
@@ -890,7 +904,10 @@ class Client extends EventEmitter {
                     return ogMethod(...args);
                 }).bind(module);
             }
+
+            window.__wwebjsEventListenersAttached = true;
         });
+        this._eventListenersAttached = true;
     }    
 
     async initWebVersionCache() {
