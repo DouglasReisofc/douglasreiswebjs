@@ -13,6 +13,11 @@
     <br />
 </div>
 
+## Fork Notice
+This is a customized, standalone fork maintained by Douglas Reis.
+It is a personalized repository and does not depend on upstream releases.
+See `CHANGELOG.md` for the list of fixes and adjustments applied in this fork.
+
 ## About
 **A WhatsApp API client that operates via the WhatsApp Web browser.**
 
