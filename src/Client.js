@@ -216,41 +216,70 @@ class Client extends EventEmitter {
                     return typeof window.Store !== 'undefined' && typeof window.WWebJS !== 'undefined';
                 });
 
+                let storeReady = injected;
                 if (!injected) {
                     if (this.options.webVersionCache.type === 'local' && this.currentIndexHtml) {
                         const { type: webCacheType, ...webCacheOptions } = this.options.webVersionCache;
                         const webCache = WebCacheFactory.createWebCache(webCacheType, webCacheOptions);
-                
+            
                         await webCache.persist(this.currentIndexHtml, version);
                     }
 
-                    if (isCometOrAbove) {
-                        await this.pupPage.evaluate(ExposeStore);
-                    } else {
-                        // make sure all modules are ready before injection
-                        // 2 second delay after authentication makes sense and does not need to be made dyanmic or removed
-                        await new Promise(r => setTimeout(r, 2000)); 
-                        await this.pupPage.evaluate(ExposeLegacyStore);
+                    const waitForStore = async (timeoutMs) => {
+                        try {
+                            await this.pupPage.waitForFunction('window.Store != undefined', { timeout: timeoutMs });
+                            return true;
+                        } catch (_) {
+                            return false;
+                        }
+                    };
+
+                    for (let attempt = 0; attempt < 3 && !storeReady; attempt++) {
+                        try {
+                            if (isCometOrAbove) {
+                                await this.pupPage.evaluate(ExposeStore);
+                            } else {
+                                // make sure all modules are ready before injection
+                                // 2 second delay after authentication makes sense and does not need to be made dyanmic or removed
+                                await new Promise(r => setTimeout(r, 2000)); 
+                                await this.pupPage.evaluate(ExposeLegacyStore);
+                            }
+                        } catch (_) {
+                            // ignore and retry
+                        }
+
+                        storeReady = await waitForStore(15000);
+                        if (!storeReady) {
+                            await new Promise(r => setTimeout(r, 1500));
+                        }
                     }
 
-                    // Check window.Store Injection
-                    await this.pupPage.waitForFunction('window.Store != undefined');
-                
-                    /**
-                         * Current connection information
-                         * @type {ClientInfo}
-                         */
-                    this.info = new ClientInfo(this, await this.pupPage.evaluate(() => {
-                        return { ...window.Store.Conn.serialize(), wid: window.Store.User.getMaybeMePnUser() || window.Store.User.getMaybeMeLidUser() };
-                    }));
+                    if (storeReady) {
+                        try {
+                            /**
+                                 * Current connection information
+                                 * @type {ClientInfo}
+                                 */
+                            this.info = new ClientInfo(this, await this.pupPage.evaluate(() => {
+                                return { ...window.Store.Conn.serialize(), wid: window.Store.User.getMaybeMePnUser() || window.Store.User.getMaybeMeLidUser() };
+                            }));
 
-                    this.interface = new InterfaceController(this);
+                            this.interface = new InterfaceController(this);
 
-                    //Load util functions (serializers, helper functions)
-                    await this.pupPage.evaluate(LoadUtils);
+                            //Load util functions (serializers, helper functions)
+                            await this.pupPage.evaluate(LoadUtils);
 
-                    await this.attachEventListeners();
+                            await this.attachEventListeners();
+                        } catch (_) {
+                            // best-effort: still allow ready to emit
+                        }
+                    }
                 }
+
+                if (!storeReady) {
+                    return;
+                }
+
                 if (!this._loadingScreenFinished) {
                     this._lastOfflineProgress = 100;
                     this._loadingScreenFinished = true;
@@ -272,6 +301,11 @@ class Client extends EventEmitter {
             if (this._lastOfflineProgress !== percent) {
                 this._lastOfflineProgress = percent;
                 this.emit(Events.LOADING_SCREEN, percent, 'WhatsApp'); // Message is hardcoded as "WhatsApp" for now
+                if (percent >= 99 && !this._appStateHasSyncedHandled && !this._appStateHasSyncedInProgress) {
+                    this.pupPage
+                        .evaluate(() => { window.onAppStateHasSyncedEvent && window.onAppStateHasSyncedEvent(); })
+                        .catch(() => {});
+                }
                 if (percent >= 100) {
                     this._loadingScreenFinished = true;
                 }
@@ -283,15 +317,31 @@ class Client extends EventEmitter {
         });
         await this.pupPage.evaluate(() => {
             const appState = window.AuthStore.AppState;
+            let syncedFallbackTriggered = false;
+            const triggerSyncedFallback = () => {
+                if (syncedFallbackTriggered) return;
+                if (appState.state === 'CONNECTED') {
+                    syncedFallbackTriggered = true;
+                    window.onAppStateHasSyncedEvent();
+                }
+            };
             if (appState.hasSynced) {
+                syncedFallbackTriggered = true;
                 window.onAppStateHasSyncedEvent();
             }
             appState.on('change:hasSynced', (_AppState, hasSynced) => {
                 if (hasSynced) {
+                    syncedFallbackTriggered = true;
                     window.onAppStateHasSyncedEvent();
                 }
             });
-            appState.on('change:state', (_AppState, state) => { window.onAuthAppStateChangedEvent(state); });
+            appState.on('change:state', (_AppState, state) => {
+                window.onAuthAppStateChangedEvent(state);
+                if (state === 'CONNECTED') {
+                    triggerSyncedFallback();
+                }
+            });
+            setTimeout(triggerSyncedFallback, 10000);
             window.AuthStore.Cmd.on('offline_progress_update', () => {
                 window.onOfflineProgressUpdateEvent(window.AuthStore.OfflineMessageHandler.getOfflineDeliveryProgress()); 
             });
