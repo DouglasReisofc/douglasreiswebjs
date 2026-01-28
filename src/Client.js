@@ -87,6 +87,9 @@ class Client extends EventEmitter {
 
         this.currentIndexHtml = null;
         this.lastLoggedOut = false;
+        this._appStateHasSyncedHandled = false;
+        this._loadingScreenFinished = false;
+        this._lastOfflineProgress = null;
 
         Util.setFfmpegPath(this.options.ffmpegPath);
     }
@@ -198,6 +201,8 @@ class Client extends EventEmitter {
         });
 
         await exposeFunctionIfAbsent(this.pupPage, 'onAppStateHasSyncedEvent', async () => {
+            if (this._appStateHasSyncedHandled) return;
+            this._appStateHasSyncedHandled = true;
             const authEventPayload = await this.authStrategy.getAuthEventPayload();
             /**
                  * Emitted when authentication is successful
@@ -244,6 +249,11 @@ class Client extends EventEmitter {
 
                 await this.attachEventListeners();
             }
+            if (!this._loadingScreenFinished) {
+                this._lastOfflineProgress = 100;
+                this._loadingScreenFinished = true;
+                this.emit(Events.LOADING_SCREEN, 100, 'WhatsApp');
+            }
             /**
                  * Emitted when the client has initialized and is ready to receive messages.
                  * @event Client#ready
@@ -251,11 +261,14 @@ class Client extends EventEmitter {
             this.emit(Events.READY);
             this.authStrategy.afterAuthReady();
         });
-        let lastPercent = null;
         await exposeFunctionIfAbsent(this.pupPage, 'onOfflineProgressUpdateEvent', async (percent) => {
-            if (lastPercent !== percent) {
-                lastPercent = percent;
+            if (this._loadingScreenFinished) return;
+            if (this._lastOfflineProgress !== percent) {
+                this._lastOfflineProgress = percent;
                 this.emit(Events.LOADING_SCREEN, percent, 'WhatsApp'); // Message is hardcoded as "WhatsApp" for now
+                if (percent >= 100) {
+                    this._loadingScreenFinished = true;
+                }
             }
         });
         await exposeFunctionIfAbsent(this.pupPage, 'onLogoutEvent', async () => {
@@ -286,6 +299,9 @@ class Client extends EventEmitter {
      * Sets up events and requirements, kicks off authentication request
      */
     async initialize() {
+        this._appStateHasSyncedHandled = false;
+        this._loadingScreenFinished = false;
+        this._lastOfflineProgress = null;
 
         let 
             /**
