@@ -87,8 +87,9 @@ class Client extends EventEmitter {
 
         this.currentIndexHtml = null;
         this.lastLoggedOut = false;
-        this._appStateHasSyncedHandled = false;
-        this._appStateHasSyncedInProgress = false;
+        this._authenticatedEmitted = false;
+        this._readyEmitted = false;
+        this._ensureReadyInProgress = false;
         this._loadingScreenFinished = false;
         this._lastOfflineProgress = null;
         this._eventListenersAttached = false;
@@ -204,39 +205,50 @@ class Client extends EventEmitter {
         });
 
         await exposeFunctionIfAbsent(this.pupPage, 'onAppStateHasSyncedEvent', async () => {
-            if (this._appStateHasSyncedHandled || this._appStateHasSyncedInProgress) return;
-            this._appStateHasSyncedInProgress = true;
-            try {
+            if (!this._authenticatedEmitted) {
                 const authEventPayload = await this.authStrategy.getAuthEventPayload();
                 /**
                      * Emitted when authentication is successful
                      * @event Client#authenticated
                      */
                 this.emit(Events.AUTHENTICATED, authEventPayload);
+                this._authenticatedEmitted = true;
+            }
 
-                const injected = await this.pupPage.evaluate(async () => {
-                    return typeof window.Store !== 'undefined' && typeof window.WWebJS !== 'undefined';
-                });
+            if (this._readyEmitted || this._ensureReadyInProgress) return;
 
-                let storeReady = injected;
-                if (!injected) {
-                    if (this.options.webVersionCache.type === 'local' && this.currentIndexHtml) {
-                        const { type: webCacheType, ...webCacheOptions } = this.options.webVersionCache;
-                        const webCache = WebCacheFactory.createWebCache(webCacheType, webCacheOptions);
-            
-                        await webCache.persist(this.currentIndexHtml, version);
+            this._ensureReadyInProgress = true;
+            try {
+                if (this.options.webVersionCache.type === 'local' && this.currentIndexHtml) {
+                    const { type: webCacheType, ...webCacheOptions } = this.options.webVersionCache;
+                    const webCache = WebCacheFactory.createWebCache(webCacheType, webCacheOptions);
+                    await webCache.persist(this.currentIndexHtml, version);
+                }
+
+                const waitForStore = async (timeoutMs) => {
+                    try {
+                        await this.pupPage.waitForFunction('window.Store != undefined', { timeout: timeoutMs });
+                        return true;
+                    } catch (_) {
+                        return false;
                     }
+                };
 
-                    const waitForStore = async (timeoutMs) => {
-                        try {
-                            await this.pupPage.waitForFunction('window.Store != undefined', { timeout: timeoutMs });
-                            return true;
-                        } catch (_) {
-                            return false;
-                        }
-                    };
+                const waitForStoreAndUtils = async (timeoutMs) => {
+                    try {
+                        await this.pupPage.waitForFunction('window.Store != undefined && window.WWebJS != undefined && window.WWebJS.getMessageModel != undefined && window.Store.Msg != undefined', { timeout: timeoutMs });
+                        return true;
+                    } catch (_) {
+                        return false;
+                    }
+                };
 
-                    for (let attempt = 0; attempt < 3 && !storeReady; attempt++) {
+                for (let attempt = 0; attempt < 5 && !this._readyEmitted; attempt++) {
+                    const injected = await this.pupPage.evaluate(async () => {
+                        return typeof window.Store !== 'undefined' && typeof window.WWebJS !== 'undefined';
+                    });
+
+                    if (!injected) {
                         try {
                             if (isCometOrAbove) {
                                 await this.pupPage.evaluate(ExposeStore);
@@ -250,61 +262,55 @@ class Client extends EventEmitter {
                             // ignore and retry
                         }
 
-                        storeReady = await waitForStore(15000);
-                        if (!storeReady) {
+                        if (!(await waitForStore(15000))) {
                             await new Promise(r => setTimeout(r, 1500));
+                            continue;
+                        }
+
+                        try {
+                            //Load util functions (serializers, helper functions)
+                            await this.pupPage.evaluate(LoadUtils);
+                        } catch (_) {
+                            // ignore and retry
                         }
                     }
 
-                    if (storeReady) {
-                        //Load util functions (serializers, helper functions)
-                        await this.pupPage.evaluate(LoadUtils);
+                    if (!(await waitForStoreAndUtils(15000))) {
+                        await new Promise(r => setTimeout(r, 1500));
+                        continue;
                     }
-                }
 
-                const waitForStoreAndUtils = async (timeoutMs) => {
-                    try {
-                        await this.pupPage.waitForFunction('window.Store != undefined && window.WWebJS != undefined && window.Store.Msg != undefined', { timeout: timeoutMs });
-                        return true;
-                    } catch (_) {
-                        return false;
+                    if (!this.info) {
+                        /**
+                             * Current connection information
+                             * @type {ClientInfo}
+                             */
+                        this.info = new ClientInfo(this, await this.pupPage.evaluate(() => {
+                            return { ...window.Store.Conn.serialize(), wid: window.Store.User.getMaybeMePnUser() || window.Store.User.getMaybeMeLidUser() };
+                        }));
                     }
-                };
 
-                if (!storeReady || !(await waitForStoreAndUtils(15000))) {
-                    return;
-                }
+                    if (!this.interface) {
+                        this.interface = new InterfaceController(this);
+                    }
 
-                if (!this.info) {
+                    await this.attachEventListeners();
+
+                    if (!this._loadingScreenFinished) {
+                        this._lastOfflineProgress = 100;
+                        this._loadingScreenFinished = true;
+                        this.emit(Events.LOADING_SCREEN, 100, 'WhatsApp');
+                    }
                     /**
-                         * Current connection information
-                         * @type {ClientInfo}
+                         * Emitted when the client has initialized and is ready to receive messages.
+                         * @event Client#ready
                          */
-                    this.info = new ClientInfo(this, await this.pupPage.evaluate(() => {
-                        return { ...window.Store.Conn.serialize(), wid: window.Store.User.getMaybeMePnUser() || window.Store.User.getMaybeMeLidUser() };
-                    }));
+                    this.emit(Events.READY);
+                    this.authStrategy.afterAuthReady();
+                    this._readyEmitted = true;
                 }
-
-                if (!this.interface) {
-                    this.interface = new InterfaceController(this);
-                }
-
-                await this.attachEventListeners();
-
-                if (!this._loadingScreenFinished) {
-                    this._lastOfflineProgress = 100;
-                    this._loadingScreenFinished = true;
-                    this.emit(Events.LOADING_SCREEN, 100, 'WhatsApp');
-                }
-                /**
-                     * Emitted when the client has initialized and is ready to receive messages.
-                     * @event Client#ready
-                     */
-                this.emit(Events.READY);
-                this.authStrategy.afterAuthReady();
-                this._appStateHasSyncedHandled = true;
             } finally {
-                this._appStateHasSyncedInProgress = false;
+                this._ensureReadyInProgress = false;
             }
         });
         await exposeFunctionIfAbsent(this.pupPage, 'onOfflineProgressUpdateEvent', async (percent) => {
@@ -312,7 +318,7 @@ class Client extends EventEmitter {
             if (this._lastOfflineProgress !== percent) {
                 this._lastOfflineProgress = percent;
                 this.emit(Events.LOADING_SCREEN, percent, 'WhatsApp'); // Message is hardcoded as "WhatsApp" for now
-                if (percent >= 99 && !this._appStateHasSyncedHandled && !this._appStateHasSyncedInProgress) {
+                if (percent >= 99 && !this._readyEmitted && !this._ensureReadyInProgress) {
                     this.pupPage
                         .evaluate(() => { window.onAppStateHasSyncedEvent && window.onAppStateHasSyncedEvent(); })
                         .catch(() => {});
@@ -366,8 +372,9 @@ class Client extends EventEmitter {
      * Sets up events and requirements, kicks off authentication request
      */
     async initialize() {
-        this._appStateHasSyncedHandled = false;
-        this._appStateHasSyncedInProgress = false;
+        this._authenticatedEmitted = false;
+        this._readyEmitted = false;
+        this._ensureReadyInProgress = false;
         this._loadingScreenFinished = false;
         this._lastOfflineProgress = null;
         this._eventListenersAttached = false;
