@@ -88,6 +88,7 @@ class Client extends EventEmitter {
         this.currentIndexHtml = null;
         this.lastLoggedOut = false;
         this._appStateHasSyncedHandled = false;
+        this._appStateHasSyncedInProgress = false;
         this._loadingScreenFinished = false;
         this._lastOfflineProgress = null;
 
@@ -201,65 +202,70 @@ class Client extends EventEmitter {
         });
 
         await exposeFunctionIfAbsent(this.pupPage, 'onAppStateHasSyncedEvent', async () => {
-            if (this._appStateHasSyncedHandled) return;
-            this._appStateHasSyncedHandled = true;
-            const authEventPayload = await this.authStrategy.getAuthEventPayload();
-            /**
-                 * Emitted when authentication is successful
-                 * @event Client#authenticated
-                 */
-            this.emit(Events.AUTHENTICATED, authEventPayload);
-
-            const injected = await this.pupPage.evaluate(async () => {
-                return typeof window.Store !== 'undefined' && typeof window.WWebJS !== 'undefined';
-            });
-
-            if (!injected) {
-                if (this.options.webVersionCache.type === 'local' && this.currentIndexHtml) {
-                    const { type: webCacheType, ...webCacheOptions } = this.options.webVersionCache;
-                    const webCache = WebCacheFactory.createWebCache(webCacheType, webCacheOptions);
-            
-                    await webCache.persist(this.currentIndexHtml, version);
-                }
-
-                if (isCometOrAbove) {
-                    await this.pupPage.evaluate(ExposeStore);
-                } else {
-                    // make sure all modules are ready before injection
-                    // 2 second delay after authentication makes sense and does not need to be made dyanmic or removed
-                    await new Promise(r => setTimeout(r, 2000)); 
-                    await this.pupPage.evaluate(ExposeLegacyStore);
-                }
-
-                // Check window.Store Injection
-                await this.pupPage.waitForFunction('window.Store != undefined');
-            
+            if (this._appStateHasSyncedHandled || this._appStateHasSyncedInProgress) return;
+            this._appStateHasSyncedInProgress = true;
+            try {
+                const authEventPayload = await this.authStrategy.getAuthEventPayload();
                 /**
-                     * Current connection information
-                     * @type {ClientInfo}
+                     * Emitted when authentication is successful
+                     * @event Client#authenticated
                      */
-                this.info = new ClientInfo(this, await this.pupPage.evaluate(() => {
-                    return { ...window.Store.Conn.serialize(), wid: window.Store.User.getMaybeMePnUser() || window.Store.User.getMaybeMeLidUser() };
-                }));
+                this.emit(Events.AUTHENTICATED, authEventPayload);
 
-                this.interface = new InterfaceController(this);
+                const injected = await this.pupPage.evaluate(async () => {
+                    return typeof window.Store !== 'undefined' && typeof window.WWebJS !== 'undefined';
+                });
 
-                //Load util functions (serializers, helper functions)
-                await this.pupPage.evaluate(LoadUtils);
+                if (!injected) {
+                    if (this.options.webVersionCache.type === 'local' && this.currentIndexHtml) {
+                        const { type: webCacheType, ...webCacheOptions } = this.options.webVersionCache;
+                        const webCache = WebCacheFactory.createWebCache(webCacheType, webCacheOptions);
+                
+                        await webCache.persist(this.currentIndexHtml, version);
+                    }
 
-                await this.attachEventListeners();
+                    if (isCometOrAbove) {
+                        await this.pupPage.evaluate(ExposeStore);
+                    } else {
+                        // make sure all modules are ready before injection
+                        // 2 second delay after authentication makes sense and does not need to be made dyanmic or removed
+                        await new Promise(r => setTimeout(r, 2000)); 
+                        await this.pupPage.evaluate(ExposeLegacyStore);
+                    }
+
+                    // Check window.Store Injection
+                    await this.pupPage.waitForFunction('window.Store != undefined');
+                
+                    /**
+                         * Current connection information
+                         * @type {ClientInfo}
+                         */
+                    this.info = new ClientInfo(this, await this.pupPage.evaluate(() => {
+                        return { ...window.Store.Conn.serialize(), wid: window.Store.User.getMaybeMePnUser() || window.Store.User.getMaybeMeLidUser() };
+                    }));
+
+                    this.interface = new InterfaceController(this);
+
+                    //Load util functions (serializers, helper functions)
+                    await this.pupPage.evaluate(LoadUtils);
+
+                    await this.attachEventListeners();
+                }
+                if (!this._loadingScreenFinished) {
+                    this._lastOfflineProgress = 100;
+                    this._loadingScreenFinished = true;
+                    this.emit(Events.LOADING_SCREEN, 100, 'WhatsApp');
+                }
+                /**
+                     * Emitted when the client has initialized and is ready to receive messages.
+                     * @event Client#ready
+                     */
+                this.emit(Events.READY);
+                this.authStrategy.afterAuthReady();
+                this._appStateHasSyncedHandled = true;
+            } finally {
+                this._appStateHasSyncedInProgress = false;
             }
-            if (!this._loadingScreenFinished) {
-                this._lastOfflineProgress = 100;
-                this._loadingScreenFinished = true;
-                this.emit(Events.LOADING_SCREEN, 100, 'WhatsApp');
-            }
-            /**
-                 * Emitted when the client has initialized and is ready to receive messages.
-                 * @event Client#ready
-                 */
-            this.emit(Events.READY);
-            this.authStrategy.afterAuthReady();
         });
         await exposeFunctionIfAbsent(this.pupPage, 'onOfflineProgressUpdateEvent', async (percent) => {
             if (this._loadingScreenFinished) return;
@@ -300,6 +306,7 @@ class Client extends EventEmitter {
      */
     async initialize() {
         this._appStateHasSyncedHandled = false;
+        this._appStateHasSyncedInProgress = false;
         this._loadingScreenFinished = false;
         this._lastOfflineProgress = null;
 
