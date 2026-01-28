@@ -823,7 +823,55 @@ class Client extends EventEmitter {
 
         await this.pupPage.evaluate(() => {
             if (window.__wwebjsEventListenersAttached) return;
-            window.Store.Msg.on('change', (msg) => { window.onChangeMessageEvent(window.WWebJS.getMessageModel(msg)); });
+            const track = window.__wwebjsMsgTrack || { seen: new Set(), order: [] };
+            const getMsgKey = (msg) => {
+                try {
+                    if (msg?.id?._serialized) return msg.id._serialized;
+                    const id = msg?.id || {};
+                    return [id.id, id.remote, id.fromMe, msg?.t].filter(Boolean).join('_');
+                } catch (_) {
+                    return null;
+                }
+            };
+            const markSeen = (key) => {
+                if (!key) return false;
+                if (track.seen.has(key)) return false;
+                track.seen.add(key);
+                track.order.push(key);
+                if (track.order.length > 2000) {
+                    const old = track.order.shift();
+                    if (old) track.seen.delete(old);
+                }
+                return true;
+            };
+            const toModel = (msg) => {
+                try {
+                    if (window.WWebJS?.getMessageModel) return window.WWebJS.getMessageModel(msg);
+                } catch (_) {}
+                try {
+                    if (msg?.serialize) return msg.serialize();
+                } catch (_) {}
+                return msg;
+            };
+            const emitIfNew = (msg) => {
+                const key = getMsgKey(msg);
+                if (!markSeen(key)) return;
+                window.onAddMessageEvent(toModel(msg));
+            };
+            window.Store.Msg.on('change', (msg) => {
+                window.onChangeMessageEvent(toModel(msg));
+                const now = Math.floor(Date.now() / 1000);
+                const isRecent = typeof msg.t === 'number' && (now - msg.t) < 60;
+                const isNew = msg.isNewMsg || msg.isNew || msg.isUnread || isRecent;
+                if (isNew) {
+                    if (msg.type === 'ciphertext') {
+                        msg.once('change:type', (_msg) => emitIfNew(_msg));
+                        window.onAddMessageCiphertextEvent(toModel(msg));
+                    } else {
+                        emitIfNew(msg);
+                    }
+                }
+            });
             window.Store.Msg.on('change:type', (msg) => { window.onChangeMessageTypeEvent(window.WWebJS.getMessageModel(msg)); });
             window.Store.Msg.on('change:ack', (msg, ack) => { window.onMessageAckEvent(window.WWebJS.getMessageModel(msg), ack); });
             window.Store.Msg.on('change:isUnsentMedia', (msg, unsent) => { if (msg.id.fromMe && !unsent) window.onMessageMediaUploadedEvent(window.WWebJS.getMessageModel(msg)); });
@@ -842,14 +890,95 @@ class Client extends EventEmitter {
                 if (isNew) {
                     if (msg.type === 'ciphertext') {
                         // defer message event until ciphertext is resolved (type changed)
-                        msg.once('change:type', (_msg) => window.onAddMessageEvent(window.WWebJS.getMessageModel(_msg)));
-                        window.onAddMessageCiphertextEvent(window.WWebJS.getMessageModel(msg));
+                        msg.once('change:type', (_msg) => emitIfNew(_msg));
+                        window.onAddMessageCiphertextEvent(toModel(msg));
                     } else {
-                        window.onAddMessageEvent(window.WWebJS.getMessageModel(msg));
+                        emitIfNew(msg);
                     }
                 }
             });
-            window.Store.Chat.on('change:unreadCount', (chat) => {window.onChatUnreadCountEvent(chat);});
+            // Fallback polling for cases where 'add' events are not fired
+            if (!window.__wwebjsMsgPoll) {
+                window.__wwebjsMsgPoll = setInterval(() => {
+                    try {
+                        const now = Math.floor(Date.now() / 1000);
+                        const models = window.Store?.Msg?.getModelsArray?.() || window.Store?.Msg?.models || [];
+                        const recent = models.slice(-50);
+                        for (const msg of recent) {
+                            const isRecent = typeof msg.t === 'number' && (now - msg.t) < 60;
+                            const isNew = msg.isNewMsg || msg.isNew || msg.isUnread || isRecent;
+                            if (!isNew) continue;
+                            if (msg.type === 'ciphertext') {
+                                msg.once('change:type', (_msg) => emitIfNew(_msg));
+                                window.onAddMessageCiphertextEvent(toModel(msg));
+                            } else {
+                                emitIfNew(msg);
+                            }
+                        }
+
+                        const chats = window.Store?.Chat?.getModelsArray?.() || window.Store?.Chat?.models || [];
+                        for (const chat of chats) {
+                            const unread = chat?.unreadCount > 0 || chat?.hasUnread;
+                            if (!unread && !chat?.lastReceivedKey) continue;
+
+                            const msgs = chat?.msgs?.getModelsArray?.() || chat?.msgs?.models || [];
+                            const slice = msgs.slice(-50);
+                            for (const msg of slice) {
+                                const isRecent = typeof msg.t === 'number' && (now - msg.t) < 60;
+                                const isNew = msg.isNewMsg || msg.isNew || msg.isUnread || isRecent || unread;
+                                if (!isNew) continue;
+                                if (msg.type === 'ciphertext') {
+                                    msg.once('change:type', (_msg) => emitIfNew(_msg));
+                                    window.onAddMessageCiphertextEvent(toModel(msg));
+                                } else {
+                                    emitIfNew(msg);
+                                }
+                            }
+
+                            if (chat?.lastReceivedKey?._serialized) {
+                                const last = window.Store.Msg.get(chat.lastReceivedKey._serialized) ||
+                                    (window.Store.Msg.getMessagesById && window.Store.Msg.getMessagesById([chat.lastReceivedKey._serialized])?.messages?.[0]);
+                                if (last) {
+                                    if (last.type === 'ciphertext') {
+                                        last.once('change:type', (_msg) => emitIfNew(_msg));
+                                        window.onAddMessageCiphertextEvent(toModel(last));
+                                    } else {
+                                        emitIfNew(last);
+                                    }
+                                }
+                            }
+                        }
+                    } catch (_) {
+                        // ignore polling errors
+                    }
+                }, 1500);
+            }
+
+            const unreadMap = window.__wwebjsUnreadMap || new Map();
+            window.Store.Chat.on('change:unreadCount', (chat) => {
+                window.onChatUnreadCountEvent(chat);
+                try {
+                    const chatId = chat?.id?._serialized || chat?.id;
+                    const prev = unreadMap.get(chatId) || 0;
+                    const curr = chat?.unreadCount || 0;
+                    unreadMap.set(chatId, curr);
+                    if (curr > prev && chat?.lastReceivedKey?._serialized) {
+                        const last = window.Store.Msg.get(chat.lastReceivedKey._serialized) ||
+                            (window.Store.Msg.getMessagesById && window.Store.Msg.getMessagesById([chat.lastReceivedKey._serialized])?.messages?.[0]);
+                        if (last) {
+                            if (last.type === 'ciphertext') {
+                                last.once('change:type', (_msg) => emitIfNew(_msg));
+                                window.onAddMessageCiphertextEvent(toModel(last));
+                            } else {
+                                emitIfNew(last);
+                            }
+                        }
+                    }
+                } catch (_) {
+                    // ignore
+                }
+            });
+            window.__wwebjsUnreadMap = unreadMap;
 
             if (window.compareWwebVersions(window.Debug.VERSION, '>=', '2.3000.1014111620')) {
                 const module = window.Store.AddonReactionTable;
@@ -917,6 +1046,7 @@ class Client extends EventEmitter {
             }
 
             window.__wwebjsEventListenersAttached = true;
+            window.__wwebjsMsgTrack = track;
         });
         this._eventListenersAttached = true;
     }    
