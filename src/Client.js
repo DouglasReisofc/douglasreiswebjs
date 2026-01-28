@@ -93,6 +93,8 @@ class Client extends EventEmitter {
         this._loadingScreenFinished = false;
         this._lastOfflineProgress = null;
         this._eventListenersAttached = false;
+        this._messageDedup = new Map();
+        this._messageDedupOrder = [];
 
         Util.setFfmpegPath(this.options.ffmpegPath);
     }
@@ -495,7 +497,43 @@ class Client extends EventEmitter {
      */
     async attachEventListeners() {
         if (this._eventListenersAttached) return;
+        const dedupeTtlMs = 10000;
+        const dedupeMax = 5000;
+        const getDedupeKey = (msg) => {
+            if (msg?.id?._serialized) return msg.id._serialized;
+            const id = msg?.id || {};
+            const idPart = id.id || id._serialized;
+            const remote = id.remote || msg?.from || msg?.to || msg?.author;
+            if (idPart || remote) {
+                return [idPart, remote, id.fromMe ? '1' : '0', msg?.t].filter(v => v !== undefined && v !== null && v !== '').join('_');
+            }
+            const body = typeof msg?.body === 'string' ? msg.body.slice(0, 80) : '';
+            const fallback = [msg?.from, msg?.author, msg?.to, msg?.t, msg?.type, body].filter(Boolean).join('|');
+            return fallback || null;
+        };
+        const shouldProcessMessage = (msg) => {
+            if (!msg) return true;
+            const key = getDedupeKey(msg);
+            if (!key) return true;
+            const now = Date.now();
+            const last = this._messageDedup.get(key);
+            if (last && (now - last) < dedupeTtlMs) {
+                return false;
+            }
+            this._messageDedup.set(key, now);
+            this._messageDedupOrder.push(key);
+            const cutoff = now - (dedupeTtlMs * 2);
+            while (this._messageDedupOrder.length) {
+                const oldestKey = this._messageDedupOrder[0];
+                const ts = this._messageDedup.get(oldestKey);
+                if (this._messageDedupOrder.length <= dedupeMax && ts && ts >= cutoff) break;
+                this._messageDedupOrder.shift();
+                if (oldestKey) this._messageDedup.delete(oldestKey);
+            }
+            return true;
+        };
         await exposeFunctionIfAbsent(this.pupPage, 'onAddMessageEvent', msg => {
+            if (!shouldProcessMessage(msg)) return;
             if (msg.type === 'gp2') {
                 const notification = new GroupNotification(this, msg);
                 if (['add', 'invite', 'linked_group_join'].includes(msg.subtype)) {
